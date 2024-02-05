@@ -35,7 +35,10 @@ spec:
             value: "1"
           args: ["docker/web/celery/flower/run.sh"]
           name: flower
-          resources: {}
+          resources:
+            requests:
+              memory: "3Gi"
+              cpu: "200m"
         - image: sovryn/rootstock-transaction-service
           imagePullPolicy: Always
           envFrom:
