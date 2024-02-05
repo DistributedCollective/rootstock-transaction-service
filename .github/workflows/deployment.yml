@@ -7,7 +7,7 @@ on:
 
 jobs:
   call-workflow-init:
-   uses: DistributedCollective/.github/.github/workflows/init.yml@ci_envs
+   uses: DistributedCollective/.github/.github/workflows/init.yml@master
    with:
      ref: ${{ github.ref }}
      base_ref: ${{ github.base_ref }}
@@ -24,7 +24,7 @@ jobs:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   call-workflow-k8s-deploy:
-    uses: DistributedCollective/.github/.github/workflows/deploy-k8s.yml@ci_envs
+    uses: DistributedCollective/.github/.github/workflows/deploy-k8s.yml@master
     needs: [call-workflow-init, call-workflow-docker-build]
     if: github.event_name != 'pull_request'
     with:
