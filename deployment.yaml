@@ -1,0 +1,153 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    deployment.kubernetes.io/revision: '1'
+  labels:
+    app: rootstock-transaction-service
+  name: rootstock-transaction-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rootstock-transaction-service
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: rootstock-transaction-service
+    spec:
+      containers:
+        - image: sovryn/rootstock-transaction-service
+          imagePullPolicy: Always
+          envFrom:
+          - secretRef:
+              name: rootstock-transaction-service
+          - secretRef:
+              name: rootstock-transaction-service-secret
+          ports:
+            - containerPort: 5555
+          env:
+          - name: WORKER_QUEUES
+            value: "default,indexing"
+          - name:  RUN_MIGRATIONS
+            value: "1"
+          args: ["docker/web/celery/flower/run.sh"]
+          name: flower
+          resources:
+            requests:
+              memory: "3Gi"
+              cpu: "200m"
+        - image: sovryn/rootstock-transaction-service
+          imagePullPolicy: Always
+          envFrom:
+          - secretRef:
+              name: rootstock-transaction-service
+          - secretRef:
+              name: rootstock-transaction-service-secret
+          ports:
+            - containerPort: 5555
+          env:
+          - name: WORKER_QUEUES
+            value: "default,indexing"
+          - name:  RUN_MIGRATIONS
+            value: "1"
+          args: ["docker/web/celery/scheduler/run.sh"]
+          name: scheduler
+          resources: {}
+        - image: sovryn/rootstock-transaction-service
+          imagePullPolicy: Always
+          envFrom:
+          - secretRef:
+              name: rootstock-transaction-service
+          - secretRef:
+              name: rootstock-transaction-service-secret
+          env:
+          - name: WORKER_QUEUES
+            value: "contracts,tokens"
+          - name:  RUN_MIGRATIONS
+            value: "1"
+          args: ["docker/web/celery/worker/run.sh"]
+          name: contracts-tokens-worker
+          resources: {}
+        - image: sovryn/rootstock-transaction-service
+          imagePullPolicy: Always
+          envFrom:
+          - secretRef:
+              name: rootstock-transaction-service
+          - secretRef:
+              name: rootstock-transaction-service-secret
+          env:
+          - name: WORKER_QUEUES
+            value: "notifications,webhooks"
+          - name:  RUN_MIGRATIONS
+            value: "1"
+          args: ["docker/web/celery/worker/run.sh"]
+          name: notifications-webhooks-worker
+          resources: {}
+        - image: sovryn/rootstock-transaction-service
+          imagePullPolicy: Always
+          envFrom:
+          - secretRef:
+              name: rootstock-transaction-service
+          - secretRef:
+              name: rootstock-transaction-service-secret
+          env:
+          - name: WORKER_QUEUES
+            value: "default,indexing"
+          - name:  RUN_MIGRATIONS
+            value: "1"
+          args: ["docker/web/celery/worker/run.sh"]
+          name: indexer-worker
+          resources: {}
+        - image: sovryn/rootstock-transaction-service
+          imagePullPolicy: Always
+          envFrom:
+          - secretRef:
+              name: rootstock-transaction-service
+          - secretRef:
+              name: rootstock-transaction-service-secret
+          name: web
+          resources: {}
+          volumeMounts:
+            - mountPath: /nginx
+              name: nginx-shared
+          args: ["docker/web/run_web.sh"]
+        - image: nginx:1.20-alpine
+          name: nginx
+          envFrom:
+          - secretRef:
+              name: rootstock-transaction-service
+          - secretRef:
+              name: rootstock-transaction-service-secret
+          ports:
+            - containerPort: 8000
+          resources: {}
+          volumeMounts:
+            - name: nginxconf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - mountPath: /nginx
+              name: nginx-shared
+      restartPolicy: Always
+      volumes:
+        - name: nginx-shared
+          emptyDir: {}
+        - name: nginxconf
+          secret:
+            secretName: rootstock-transaction-service-nginx
+      imagePullSecrets:
+        - name: regcred
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rootstock-transaction-service
+spec:
+  selector:
+    app: rootstock-transaction-service
+  ports:
+    - port: 443
+      targetPort: 8000
+  type: NodePort
