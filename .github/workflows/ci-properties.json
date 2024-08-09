@@ -1,0 +1,26 @@
+{
+  "app_name": "rootstock-transaction-service",
+  "aws_region": "us-east-2",
+  "k8s_cluster_name": "k8-mainnet",
+  "registry": "docker.io",
+  "image_name": "sovryn/rootstock-transaction-service",
+  "prod_branch": "rootstock",
+  "dev_branch": "rootstock-stg",
+  "dockerfile_path": "./docker/web",
+  "APP_ENV_VARS": {
+    "PYTHONPATH": "/app/",
+    "C_FORCE_ROOT": "true",
+    "DEBUG": "0",
+    "ETH_L2_NETWORK": "1",
+    "ETH_INTERNAL_NO_FILTER": "1",
+    "DJANGO_SU_NAME": "sovryn",
+    "DJANGO_SU_EMAIL": "sovryn@sovryn.app",
+    "DJANGO_SETTINGS_MODULE": "config.settings.production"
+  },
+  "DEV_ENV_VARS": {
+    "INGRESS_HOSTNAME": "safe-tx.test.sovryn.app"
+  },
+  "PROD_ENV_VARS": {
+    "INGRESS_HOSTNAME": "safe-tx.sovryn.app"
+  }
+}

@@ -64,6 +64,7 @@ if SSO_ENABLED:
 # ------------------------------------------------------------------------------
 # Django Admin URL regex.
 ADMIN_URL = env("DJANGO_ADMIN_URL", default="admin/")
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTOCOL", "https")
 
 # Gunicorn
 # ------------------------------------------------------------------------------

@@ -25,11 +25,16 @@ fi
 echo "==> $(date +%H:%M:%S) ==> Check RPC connected matches previously used RPC... "
 python manage.py check_chainid_matches
 
-echo "==> $(date +%H:%M:%S) ==> Running Celery worker for queues $WORKER_QUEUES with concurrency $TASK_CONCURRENCY <=="
-exec celery --no-color -A config.celery_app worker \
-     --pool=gevent \
-     --loglevel $log_level \
-     --concurrency="${TASK_CONCURRENCY}" \
-     --without-heartbeat \
-     --without-gossip \
-     --without-mingle -E -Q "$WORKER_QUEUES"
+# Run Celery as root
+export C_FORCE_ROOT=true
+
+echo "==> $(date +%H:%M:%S) ==> Running Celery worker with a max_memory_per_child of ${MAX_MEMORY_PER_CHILD} <=="
+# https://github.com/sumitasok/celery/issues/5#issuecomment-781717855
+exec celery -C -A config.celery_app worker \
+     --loglevel $log_level --pool=gevent \
+     -E  \
+     --concurrency=${TASK_CONCURRENCY} \
+     --max-memory-per-child=${MAX_MEMORY_PER_CHILD} \
+     --max-tasks-per-child=${MAX_TASKS_PER_CHILD} \
+     --without-heartbeat --without-gossip \
+     --without-mingle -Q "$WORKER_QUEUES"

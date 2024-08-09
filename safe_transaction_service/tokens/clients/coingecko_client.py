@@ -78,3 +78,39 @@ class CoingeckoClient(BaseHTTPClient):
         token_info = self.get_token_info(token_address)
         if token_info:
             return token_info["image"]["large"]
+
+    def get_ada_usd_price(self) -> float:
+        return self.get_price("cardano")
+
+    def get_avax_usd_price(self) -> float:
+        return self.get_price("avalanche-2")
+
+    def get_aoa_usd_price(self) -> float:
+        return self.get_price("aurora")
+
+    def get_bnb_usd_price(self) -> float:
+        return self.get_price("binancecoin")
+
+    def get_ewt_usd_price(self) -> float:
+        return self.get_price("energy-web-token")
+
+    def get_matic_usd_price(self) -> float:
+        return self.get_price("matic-network")
+
+    def get_gather_usd_price(self) -> float:
+        return self.get_price("gather")
+
+    def get_fuse_usd_price(self) -> float:
+        return self.get_price("fuse-network-token")
+
+    def get_kcs_usd_price(self) -> float:
+        return self.get_price("kucoin-shares")
+
+    def get_metis_usd_price(self) -> float:
+        return self.get_price("metis-token")
+
+    def get_btc_usd_price(self) -> float:
+        return self.get_price("bitcoin")
+
+    def get_mtr_usd_price(self) -> float:
+        return self.get_price("meter-stable")
