@@ -10,6 +10,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Self,
     Sequence,
     Set,
     Tuple,
@@ -27,6 +28,7 @@ from django.db import IntegrityError, connection, models, transaction
 from django.db.models import Case, Count, Exists, Index, JSONField, Max, Q, QuerySet
 from django.db.models.expressions import F, OuterRef, RawSQL, Subquery, Value, When
 from django.db.models.functions import Coalesce
+from django.db.models.query import RawQuerySet
 from django.db.models.signals import post_save
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -40,16 +42,22 @@ from web3.types import EventData
 from gnosis.eth.constants import ERC20_721_TRANSFER_TOPIC, NULL_ADDRESS
 from gnosis.eth.django.models import (
     EthereumAddressV2Field,
-    HexField,
+    HexV2Field,
     Keccak256Field,
     Uint256Field,
 )
 from gnosis.eth.utils import fast_to_checksum_address
-from gnosis.safe import SafeOperation
+from gnosis.safe import SafeOperationEnum
 from gnosis.safe.safe import SafeInfo
 from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
 
+from safe_transaction_service.account_abstraction.constants import (
+    USER_OPERATION_EVENT_TOPIC,
+)
 from safe_transaction_service.contracts.models import Contract
+from safe_transaction_service.utils.constants import (
+    SIGNATURE_LENGTH as MAX_SIGNATURE_LENGTH,
+)
 
 from .utils import clean_receipt_log
 
@@ -69,7 +77,7 @@ class EthereumTxCallType(Enum):
     STATIC_CALL = 3
 
     @staticmethod
-    def parse_call_type(call_type: Optional[str]):
+    def parse_call_type(call_type: Optional[str]) -> Optional[Self]:
         if not call_type:
             return None
 
@@ -251,7 +259,7 @@ class EthereumBlockManager(models.Manager):
                     f"Marking block as not confirmed"
                 )
 
-    @lru_cache(maxsize=10000)
+    @lru_cache(maxsize=10_000)
     def get_timestamp_by_hash(self, block_hash: HexBytes) -> datetime.datetime:
         try:
             return self.values("timestamp").get(block_hash=block_hash)["timestamp"]
@@ -358,6 +366,16 @@ class EthereumTxManager(models.Manager):
             to=tx.get("to"),
             value=tx["value"],
             type=tx.get("type", 0),
+        )
+
+    def account_abstraction_txs(self) -> RawQuerySet:
+        """
+        :return: Transactions containing ERC4337 `UserOperation` event
+        """
+        query = '{"topics": ["' + USER_OPERATION_EVENT_TOPIC.hex() + '"]}'
+
+        return self.raw(
+            f"SELECT * FROM history_ethereumtx WHERE '{query}'::jsonb <@ ANY (logs)"
         )
 
 
@@ -495,7 +513,11 @@ class TokenTransfer(models.Model):
             Index(fields=["_from", "timestamp"]),
             Index(fields=["to", "timestamp"]),
         ]
-        unique_together = (("ethereum_tx", "log_index"),)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ethereum_tx", "log_index"], name="unique_token_transfer_index"
+            )
+        ]
 
     def __str__(self):
         return f"Token Transfer from={self._from} to={self.to}"
@@ -560,7 +582,11 @@ class ERC20Transfer(TokenTransfer):
         abstract = False
         verbose_name = "ERC20 Transfer"
         verbose_name_plural = "ERC20 Transfers"
-        unique_together = (("ethereum_tx", "log_index"),)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ethereum_tx", "log_index"], name="unique_erc20_transfer_index"
+            )
+        ]
 
     def __str__(self):
         return f"ERC20 Transfer from={self._from} to={self.to} value={self.value}"
@@ -672,7 +698,11 @@ class ERC721Transfer(TokenTransfer):
         abstract = False
         verbose_name = "ERC721 Transfer"
         verbose_name_plural = "ERC721 Transfers"
-        unique_together = (("ethereum_tx", "log_index"),)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ethereum_tx", "log_index"], name="unique_erc721_transfer_index"
+            )
+        ]
 
     def __str__(self):
         return (
@@ -957,7 +987,12 @@ class InternalTx(models.Model):
     error = models.CharField(max_length=200, null=True)
 
     class Meta:
-        unique_together = (("ethereum_tx", "trace_address"),)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ethereum_tx", "trace_address"],
+                name="unique_internal_tx_trace_address",
+            )
+        ]
         indexes = [
             models.Index(
                 name="history_internaltx_value_idx",
@@ -970,6 +1005,12 @@ class InternalTx(models.Model):
             Index(
                 name="history_internal_transfer_idx",
                 fields=["to", "timestamp"],
+                include=["ethereum_tx_id", "block_number"],
+                condition=Q(call_type=0) & Q(value__gt=0),
+            ),
+            Index(
+                name="history_internal_transfer_from",
+                fields=["_from", "timestamp"],
                 include=["ethereum_tx_id", "block_number"],
                 condition=Q(call_type=0) & Q(value__gt=0),
             ),
@@ -1099,7 +1140,7 @@ class InternalTxDecodedQuerySet(models.QuerySet):
         """
         :return: Transactions ordered to be processed. First `setup` and then older transactions
         """
-        return self.annotate(
+        return self.alias(
             is_setup=Case(
                 When(function_name="setup", then=Value(0)),
                 default=Value(1),
@@ -1124,7 +1165,7 @@ class InternalTxDecodedQuerySet(models.QuerySet):
         return (
             self.pending_for_safes()
             .filter(internal_tx___from=safe_address)
-            .select_related("internal_tx")
+            .select_related("internal_tx", "internal_tx__ethereum_tx")
         )
 
     def safes_pending_to_be_processed(self) -> QuerySet[ChecksumAddress]:
@@ -1316,12 +1357,26 @@ class MultisigTransactionQuerySet(models.QuerySet):
 
         :return: queryset with `confirmations_required: int` field
         """
+
+        """
+        SafeStatus works the following way:
+            - First entry of any Multisig Transactions is `execTransaction`, that increments the nonce.
+            - Next entries are configuration changes on the Safe.
+        For example, for a Multisig Transaction with nonce 1 changing the threshold the `SafeStatus` table
+        will look like:
+            - setup with nonce 0
+            - execTransaction with nonce already increased to 1 for a previous Multisig Transaction.
+            - execTransaction with nonce already increased to 2, old threshold and internal_tx_id=7 (auto increased id).
+            - changeThreshold with nonce already increased to 2, new threshold and internal_tx_id=8 (any number
+              higher than 7).
+        We need to get the previous entry to get the proper threshold at that point before it's changed.
+        """
         threshold_safe_status_query = (
             SafeStatus.objects.filter(
                 address=OuterRef("safe"),
-                internal_tx__ethereum_tx=OuterRef("ethereum_tx"),
+                nonce=OuterRef("nonce"),
             )
-            .sorted_reverse_by_mined()
+            .order_by("-internal_tx_id")
             .values("threshold")
         )
 
@@ -1353,7 +1408,7 @@ class MultisigTransactionQuerySet(models.QuerySet):
         )
         return (
             self.not_executed()
-            .annotate(
+            .alias(
                 max_executed_nonce=Coalesce(
                     Subquery(subquery), Value(-1), output_field=Uint256Field()
                 )
@@ -1366,6 +1421,7 @@ class MultisigTransaction(TimeStampedModel):
     objects = MultisigTransactionManager.from_queryset(MultisigTransactionQuerySet)()
     safe_tx_hash = Keccak256Field(primary_key=True)
     safe = EthereumAddressV2Field(db_index=True)
+    proposer = EthereumAddressV2Field(null=True)
     ethereum_tx = models.ForeignKey(
         EthereumTx,
         null=True,
@@ -1378,7 +1434,7 @@ class MultisigTransaction(TimeStampedModel):
     value = Uint256Field()
     data = models.BinaryField(null=True, blank=True, editable=True)
     operation = models.PositiveSmallIntegerField(
-        choices=[(tag.value, tag.name) for tag in SafeOperation]
+        choices=[(tag.value, tag.name) for tag in SafeOperationEnum]
     )
     safe_tx_gas = Uint256Field()
     base_gas = Uint256Field()
@@ -1396,6 +1452,12 @@ class MultisigTransaction(TimeStampedModel):
     class Meta:
         permissions = [
             ("create_trusted", "Can create trusted transactions"),
+        ]
+        indexes = [
+            Index(
+                name="history_multisigtx_safe_sorted",
+                fields=["safe", "-nonce", "-created"],
+            ),
         ]
 
     def __str__(self):
@@ -1429,7 +1491,7 @@ class MultisigTransaction(TimeStampedModel):
         :return: `True` if data should be decoded, `False` otherwise
         """
         return not (
-            self.operation == SafeOperation.DELEGATE_CALL.value
+            self.operation == SafeOperationEnum.DELEGATE_CALL.value
             and self.to not in Contract.objects.trusted_addresses_for_delegate_call()
         )
 
@@ -1462,7 +1524,7 @@ class ModuleTransaction(TimeStampedModel):
     value = Uint256Field()
     data = models.BinaryField(null=True)
     operation = models.PositiveSmallIntegerField(
-        choices=[(tag.value, tag.name) for tag in SafeOperation]
+        choices=[(tag.value, tag.name) for tag in SafeOperationEnum]
     )
     failed = models.BooleanField(default=False)
 
@@ -1521,13 +1583,18 @@ class MultisigConfirmation(TimeStampedModel):
     )  # Use this while we don't have a `multisig_transaction`
     owner = EthereumAddressV2Field()
 
-    signature = HexField(null=True, default=None, max_length=5000)
+    signature = HexV2Field(null=True, default=None, max_length=MAX_SIGNATURE_LENGTH)
     signature_type = models.PositiveSmallIntegerField(
         choices=[(tag.value, tag.name) for tag in SafeSignatureType], db_index=True
     )
 
     class Meta:
-        unique_together = (("multisig_transaction_hash", "owner"),)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["multisig_transaction_hash", "owner"],
+                name="unique_multisig_transaction_owner_confirmation",
+            )
+        ]
         ordering = ["created"]
 
     def __str__(self):
@@ -1605,7 +1672,7 @@ class SafeMasterCopyQueryset(models.QuerySet):
 class SafeMasterCopy(MonitoredAddress):
     objects = SafeMasterCopyManager.from_queryset(SafeMasterCopyQueryset)()
     version = models.CharField(max_length=20, validators=[validate_version])
-    deployer = models.CharField(max_length=50, default="Gnosis")
+    deployer = models.CharField(max_length=50, default="Safe")
     l2 = models.BooleanField(default=False)
 
     class Meta:
@@ -1616,70 +1683,6 @@ class SafeMasterCopy(MonitoredAddress):
 class SafeContractManager(models.Manager):
     def get_banned_safes(self) -> QuerySet[ChecksumAddress]:
         return self.filter(banned=True).values_list("address", flat=True)
-
-    def get_count_relevant_txs_for_safe(self, address: ChecksumAddress) -> int:
-        """
-        This method searches multiple tables and count every tx or event for a Safe.
-        It will return the same or higher value if compared to counting ``get_all_tx_identifiers``
-        as that method will group some transactions (for example, 3 ERC20 can be grouped in a ``MultisigTransaction``,
-        so it will be ``1`` element for ``get_all_tx_identifiers`` but ``4`` for this function.
-
-        This query should be pretty fast, and it's meant to be used for invalidating caches.
-
-        :param address:
-        :return: number of relevant txs for a Safe
-        """
-
-        query = """
-                SELECT SUM(count_all)
-                FROM (
-                    -- Get multisig transactions
-                    SELECT COUNT(*) AS count_all
-                    FROM "history_multisigtransaction"
-                    WHERE "history_multisigtransaction"."safe" = %s
-                    UNION ALL
-                    -- Get confirmations
-                    SELECT COUNT(*)
-                    FROM "history_multisigtransaction"
-                       JOIN "history_multisigconfirmation" ON "history_multisigtransaction"."safe_tx_hash" = "history_multisigconfirmation"."multisig_transaction_id"
-                    WHERE "history_multisigtransaction"."safe" = %s
-                    UNION ALL
-                    -- Get ERC20 Transfers
-                    SELECT COUNT(*)
-                    FROM "history_erc20transfer"
-                    WHERE (
-                            "history_erc20transfer"."to" = %s
-                            OR "history_erc20transfer"."_from" = %s
-                        )
-                    UNION ALL
-                    -- Get ERC721 Transfers
-                    SELECT COUNT(*)
-                    FROM "history_erc721transfer"
-                    WHERE (
-                            "history_erc721transfer"."to" = %s
-                            OR "history_erc721transfer"."_from" = %s
-                        )
-                    UNION ALL
-                    -- Get Ether Transfers
-                    SELECT COUNT(*)
-                    FROM "history_internaltx"
-                    WHERE (
-                            "history_internaltx"."call_type" = 0
-                            AND "history_internaltx"."to" = %s
-                            AND "history_internaltx"."value" > 0
-                        )
-                    UNION ALL
-                    -- Get Module Transactions
-                    SELECT COUNT(*)
-                    FROM "history_moduletransaction"
-                    WHERE "history_moduletransaction"."safe" = %s
-                ) subquery
-                """
-
-        with connection.cursor() as cursor:
-            hex_address = HexBytes(address)
-            cursor.execute(query, [hex_address] * 8)
-            return cursor.fetchone()[0]
 
 
 class SafeContract(models.Model):
@@ -1714,33 +1717,55 @@ class SafeContract(models.Model):
 
 
 class SafeContractDelegateManager(models.Manager):
-    def get_delegates_for_safe(self, address: ChecksumAddress) -> Set[ChecksumAddress]:
-        return set(
-            self.filter(safe_contract_id=address)
-            .values_list("delegate", flat=True)
-            .distinct()
+    def get_for_safe(
+        self, safe_address: ChecksumAddress, owner_addresses: Sequence[ChecksumAddress]
+    ) -> QuerySet["SafeContractDelegate"]:
+        if not owner_addresses:
+            return self.none()
+
+        return self.filter(
+            # If safe_contract is null on SafeContractDelegate, delegates are valid for every Safe
+            Q(safe_contract_id=safe_address)
+            | Q(safe_contract=None)
+        ).filter(delegator__in=owner_addresses)
+
+    def get_for_safe_and_delegate(
+        self,
+        safe_address: ChecksumAddress,
+        owner_addresses: Sequence[ChecksumAddress],
+        delegate: ChecksumAddress,
+    ) -> QuerySet["SafeContractDelegate"]:
+        return self.get_for_safe(safe_address, owner_addresses).filter(
+            delegate=delegate
         )
 
     def get_delegates_for_safe_and_owners(
         self, safe_address: ChecksumAddress, owner_addresses: Sequence[ChecksumAddress]
     ) -> Set[ChecksumAddress]:
-        if not owner_addresses:
-            return set()
         return set(
-            self.filter(
-                # If safe_contract is null on SafeContractDelegate, delegates are valid for every Safe
-                Q(safe_contract_id=safe_address)
-                | Q(safe_contract=None)
-            )
-            .filter(delegator__in=owner_addresses)
+            self.get_for_safe(safe_address, owner_addresses)
             .values_list("delegate", flat=True)
             .distinct()
         )
 
+    def remove_delegates_for_owner_in_safe(
+        self, safe_address: ChecksumAddress, owner_address: ChecksumAddress
+    ) -> int:
+        """
+        This method deletes delegated users only if the safe address and the owner address match.
+        Used when an owner is removed from the Safe.
+
+        :return: number of delegated users deleted
+        """
+        return self.filter(
+            safe_contract_id=safe_address, delegator=owner_address
+        ).delete()[0]
+
 
 class SafeContractDelegate(models.Model):
     """
-    The owners of the Safe can add users so they can propose/retrieve txs as if they were the owners of the Safe
+    Owners (delegators) can delegate on delegates, so they can propose trusted transactions
+    in their name
     """
 
     objects = SafeContractDelegateManager()
@@ -1750,15 +1775,20 @@ class SafeContractDelegate(models.Model):
         related_name="safe_contract_delegates",
         null=True,
         default=None,
-    )
-    delegate = EthereumAddressV2Field()
-    delegator = EthereumAddressV2Field()  # Owner who created the delegate
+    )  # If safe_contract is not defined, delegate is valid for every Safe which delegator is an owner
+    delegate = EthereumAddressV2Field(db_index=True)
+    delegator = EthereumAddressV2Field(db_index=True)  # Owner who created the delegate
     label = models.CharField(max_length=50)
     read = models.BooleanField(default=True)  # For permissions in the future
     write = models.BooleanField(default=True)
 
     class Meta:
-        unique_together = (("safe_contract", "delegate", "delegator"),)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["safe_contract", "delegate", "delegator"],
+                name="unique_safe_contract_delegate_delegator",
+            )
+        ]
 
     def __str__(self):
         return (
@@ -1971,9 +2001,12 @@ class SafeStatus(SafeStatusBase):
     class Meta:
         indexes = [
             Index(fields=["address", "-nonce"]),  # Index on address and nonce DESC
-            Index(fields=["address", "-nonce", "-internal_tx"]),  # For Window search
         ]
-        unique_together = (("internal_tx", "address"),)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["internal_tx", "address"], name="unique_safe_tx_address_status"
+            )
+        ]
         verbose_name_plural = "Safe statuses"
 
     def __str__(self):
@@ -2007,6 +2040,7 @@ class WebHookType(Enum):
     OUTGOING_TOKEN = 9
     MESSAGE_CREATED = 10
     MESSAGE_CONFIRMATION = 11
+    DELETED_MULTISIG_TRANSACTION = 12
 
 
 class WebHookQuerySet(models.QuerySet):
@@ -2060,7 +2094,11 @@ class WebHook(models.Model):
     )
 
     class Meta:
-        unique_together = (("address", "url"),)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["address", "url"], name="unique_webhook_address_url"
+            )
+        ]
 
     def __str__(self):
         if self.address:
